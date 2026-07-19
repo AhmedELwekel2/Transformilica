@@ -1,0 +1,11 @@
+Flask
+pandas
+numpy
+gunicorn
+python-dotenv
+google-generativeai
+openai
+anthropic
+streamlit
+plotly
+requests
