@@ -4041,5 +4041,124 @@ def recommendations():
         return jsonify({"status": "error", "message": f"Unexpected error: {str(e)}"}), 500
 
 
+@app.route('/ai/user-segmentation', methods=['POST'])
+def user_segmentation():
+    """Assign every customer to an RFM segment and return the customers grouped by
+    segment. Unlike /ai/rfm-analysis (which returns aggregate stats), this lists each
+    user under the segment they belong to."""
+    try:
+        if 'data' not in request.files:
+            return jsonify({"status": "error", "message": "No file part in the request"}), 400
+        data_file = request.files['data']
+        if data_file.filename == '':
+            return jsonify({"status": "error", "message": "No file selected"}), 400
+
+        # Optional cap on how many customers to list per segment (0/absent = all).
+        mps = request.form.get('max_per_segment')
+        max_per_segment = int(mps) if mps else None
+
+        encodings = ["utf-8", "latin-1", "utf-8-sig", "cp1252", "utf-16"]
+        delimiters = [",", ";"]
+        df = None
+        for encoding in encodings:
+            for delimiter in delimiters:
+                data_file.stream.seek(0)
+                try:
+                    df = pd.read_csv(data_file, encoding=encoding, delimiter=delimiter, on_bad_lines="skip")
+                    break
+                except Exception as e:
+                    print(f"Failed enc={encoding} delim='{delimiter}': {e}")
+            if df is not None:
+                break
+        if df is None or df.empty or len(df.columns) == 0:
+            return jsonify({"status": "error", "message": "Could not parse a valid CSV"}), 400
+
+        roles = pattern_roles(df)
+        customer_cols = [c for c in roles.get('customer_id_columns', []) if c in df.columns]
+        date_cols = [c for c in roles.get('date_columns', []) if c in df.columns]
+        monetary_cols = [c for c in roles.get('monetary_columns', []) if c in df.columns]
+        quantity_cols = [c for c in roles.get('quantity_columns', []) if c in df.columns]
+        unit_price_cols = [c for c in roles.get('unit_price_columns', []) if c in df.columns]
+
+        if not customer_cols:
+            return jsonify({"status": "error",
+                            "message": "Segmentation needs a customer column to group by.",
+                            "detected": {"customerColumns": []}}), 200
+        if not date_cols:
+            return jsonify({"status": "error",
+                            "message": "RFM segmentation needs a date column (for recency)."}), 200
+
+        customer_col = customer_cols[0]
+        monetary_col = None
+        if monetary_cols:
+            monetary_col = monetary_cols[0]
+        elif quantity_cols and unit_price_cols:
+            df['line_total'] = (pd.to_numeric(df[quantity_cols[0]], errors='coerce') *
+                                pd.to_numeric(df[unit_price_cols[0]], errors='coerce'))
+            monetary_col = 'line_total'
+        if not monetary_col:
+            return jsonify({"status": "error",
+                            "message": "RFM segmentation needs a money column (a total, or quantity + unit price)."}), 200
+
+        seg_map = compute_customer_segments(df, date_cols[0], customer_col, monetary_col)
+        if not seg_map:
+            return jsonify({"status": "error", "message": "No valid customer records after cleaning."}), 200
+
+        descriptions = {
+            'Champions': 'Recent, frequent, high spend — your best customers.',
+            'Loyal Customers': 'Buy regularly and spend well.',
+            'Potential Loyalists': 'Recent customers with growing engagement.',
+            'New Customers': 'Bought recently but only once or twice.',
+            'Need Attention': 'Average recency/frequency — worth a nudge.',
+            'At Risk': "Were valuable but haven't purchased in a while.",
+            'Cannot Lose Them': 'High-frequency customers going quiet — urgent.',
+            'Hibernating': 'Low activity, long since last purchase.',
+            'Lost': 'Little activity and lowest value.',
+        }
+
+        groups = defaultdict(list)
+        for cid, info in seg_map.items():
+            groups[info['segment']].append({
+                "customerId": cid,
+                "recency": info.get('recency'),
+                "frequency": info.get('frequency'),
+                "monetary": info.get('monetary'),
+            })
+
+        total = len(seg_map)
+        segments_out = []
+        for seg_name, members in groups.items():
+            members.sort(key=lambda x: x['monetary'] or 0, reverse=True)  # top customers lead
+            listed = members[:max_per_segment] if max_per_segment else members
+            segments_out.append({
+                "segment": seg_name,
+                "description": descriptions.get(seg_name, ""),
+                "priority": SEGMENT_PRIORITY.get(seg_name, 0),
+                "count": len(members),
+                "percentage": round(len(members) / total * 100, 2) if total else 0,
+                "customers": listed,
+            })
+
+        # Most valuable / at-risk segments first.
+        segments_out.sort(key=lambda x: x['priority'], reverse=True)
+
+        return jsonify({
+            "status": "success",
+            "message": None,
+            "columnsUsed": {
+                "customerColumn": customer_col,
+                "dateColumn": date_cols[0],
+                "monetaryColumn": monetary_col,
+            },
+            "totalCustomers": total,
+            "segmentCount": len(segments_out),
+            "segments": segments_out,
+        }), 200
+
+    except Exception as e:
+        print(f"Unexpected error in user segmentation: {str(e)}")
+        return jsonify({"status": "error", "message": f"Unexpected error: {str(e)}"}), 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=os.getenv("PORT"), debug=True)
